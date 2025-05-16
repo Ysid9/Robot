@@ -1,0 +1,513 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import matplotlib.animation as animation
+from matplotlib.gridspec import GridSpec
+import math
+import time
+import threading
+import queue
+from collections import deque
+import copy
+
+class RobotMonitor:
+    """
+    Module de monitoring pour visualiser en temps réel les différentes métriques 
+    de l'apprentissage en ligne du robot Pioneer.
+    """
+    
+    def __init__(self, max_points=1000, update_interval=100):
+        """
+        Initialise le moniteur de robot.
+        
+        Args:
+            max_points (int): Nombre maximum de points à conserver dans l'historique
+            update_interval (int): Intervalle de mise à jour de l'affichage en ms
+        """
+        # Configuration
+        self.max_points = max_points
+        self.update_interval = update_interval
+        
+        # Données à suivre
+        self.cost_history = deque(maxlen=max_points)
+        self.trajectory = deque(maxlen=max_points)
+        self.wheel_speeds = deque(maxlen=max_points)
+        self.gradients = deque(maxlen=max_points)
+        self.distances = deque(maxlen=max_points)
+        self.timestamps = deque(maxlen=max_points)
+        self.target = [0, 0, 0]  # Position cible [x, y, theta]
+        
+        # Thread sécurisé pour échanger des données
+        self.data_queue = queue.Queue()
+        self.running = False
+        self.paused = False
+        
+        # La figure sera initialisée dans start()
+        self.fig = None
+        self.ani = None
+        
+    def setup_plots(self):
+        """Initialise la structure des graphiques"""
+        plt.ion()  # Mode interactif pour mise à jour en temps réel
+        
+        # Créer la figure principale avec GridSpec pour un meilleur contrôle
+        self.fig = plt.figure(figsize=(15, 10), facecolor='#f8f9fa')
+        self.fig.canvas.manager.set_window_title('Robot Pioneer - Monitoring en temps réel')
+        gs = GridSpec(3, 3, figure=self.fig)
+        
+        # Graphique de la trajectoire (plus grand, occupe 2 lignes)
+        self.ax_trajectory = self.fig.add_subplot(gs[0:2, 0:2])
+        self.ax_trajectory.set_title('Trajectoire du robot', fontweight='bold')
+        self.ax_trajectory.set_xlabel('Position X (m)')
+        self.ax_trajectory.set_ylabel('Position Y (m)')
+        self.ax_trajectory.grid(True, linestyle='--', alpha=0.7)
+        self.trajectory_line, = self.ax_trajectory.plot([], [], 'b-', linewidth=2, label='Trajectoire')
+        self.trajectory_point, = self.ax_trajectory.plot([], [], 'ro', markersize=8, label='Position actuelle')
+        self.target_point, = self.ax_trajectory.plot([], [], 'g*', markersize=12, label='Cible')
+        self.ax_trajectory.legend(loc='upper right')
+        
+        # Graphique de la fonction de coût
+        self.ax_cost = self.fig.add_subplot(gs[0, 2])
+        self.ax_cost.set_title('Fonction de coût', fontweight='bold')
+        self.ax_cost.set_xlabel('Temps (s)')
+        self.ax_cost.set_ylabel('Coût')
+        self.ax_cost.grid(True, linestyle='--', alpha=0.7)
+        self.cost_line, = self.ax_cost.plot([], [], 'r-', linewidth=2)
+        
+        # Graphique des vitesses des roues
+        self.ax_wheels = self.fig.add_subplot(gs[1, 2])
+        self.ax_wheels.set_title('Vitesses des roues', fontweight='bold')
+        self.ax_wheels.set_xlabel('Temps (s)')
+        self.ax_wheels.set_ylabel('Vitesse (rad/s)')
+        self.ax_wheels.grid(True, linestyle='--', alpha=0.7)
+        self.left_wheel_line, = self.ax_wheels.plot([], [], 'b-', linewidth=2, label='Roue gauche')
+        self.right_wheel_line, = self.ax_wheels.plot([], [], 'g-', linewidth=2, label='Roue droite')
+        self.ax_wheels.legend(loc='upper right')
+        
+        # Graphique du gradient
+        self.ax_gradient = self.fig.add_subplot(gs[2, 0])
+        self.ax_gradient.set_title('Gradient', fontweight='bold')
+        self.ax_gradient.set_xlabel('Temps (s)')
+        self.ax_gradient.set_ylabel('Valeur du gradient')
+        self.ax_gradient.grid(True, linestyle='--', alpha=0.7)
+        self.grad_line_left, = self.ax_gradient.plot([], [], 'c-', linewidth=2, label='Grad roue gauche')
+        self.grad_line_right, = self.ax_gradient.plot([], [], 'm-', linewidth=2, label='Grad roue droite')
+        self.ax_gradient.legend(loc='upper right')
+        
+        # Graphique des distances (erreurs)
+        self.ax_distance = self.fig.add_subplot(gs[2, 1:3])
+        self.ax_distance.set_title('Erreurs de position', fontweight='bold')
+        self.ax_distance.set_xlabel('Temps (s)')
+        self.ax_distance.set_ylabel('Erreur')
+        self.ax_distance.grid(True, linestyle='--', alpha=0.7)
+        self.distance_x_line, = self.ax_distance.plot([], [], 'r-', linewidth=2, label='Erreur X')
+        self.distance_y_line, = self.ax_distance.plot([], [], 'g-', linewidth=2, label='Erreur Y')
+        self.distance_theta_line, = self.ax_distance.plot([], [], 'b-', linewidth=2, label='Erreur θ')
+        self.ax_distance.legend(loc='upper right')
+        
+        # Ajuster les espacements
+        self.fig.tight_layout(pad=3.0)
+        
+        # Timer pour les mises à jour - Utiliser un nombre explicite de sauvegardes
+        self.ani = animation.FuncAnimation(
+            self.fig, 
+            self.update_plots, 
+            interval=self.update_interval,
+            blit=False,
+            cache_frame_data=False,  # Désactiver le cache des frames
+            save_count=100  # Limiter le nombre de frames sauvegardées
+        )
+    
+    def update_plots(self, frame):
+        """Mise à jour des graphiques avec les dernières données"""
+        # Traiter toutes les données en attente dans la queue
+        while not self.data_queue.empty():
+            try:
+                data_point = self.data_queue.get_nowait()
+                if data_point['type'] == 'data':
+                    # Ajouter les données aux historiques
+                    if 'cost' in data_point:
+                        self.cost_history.append(data_point['cost'])
+                    if 'position' in data_point:
+                        self.trajectory.append(data_point['position'])
+                    if 'wheel_speeds' in data_point:
+                        self.wheel_speeds.append(data_point['wheel_speeds'])
+                    if 'gradient' in data_point:
+                        self.gradients.append(data_point['gradient'])
+                    if 'distances' in data_point:
+                        self.distances.append(data_point['distances'])
+                    if 'timestamp' in data_point:
+                        self.timestamps.append(data_point['timestamp'])
+                    
+                elif data_point['type'] == 'target':
+                    self.target = data_point['target']
+                    # Mettre à jour le point cible dans le graphique de trajectoire
+                    self.target_point.set_data([self.target[0]], [self.target[1]])
+                    
+                    # Ajuster les limites du graphique de trajectoire
+                    margin = 1.0  # Marge en mètres
+                    self.ax_trajectory.set_xlim(
+                        min(min([t[0] for t in self.trajectory] or [0]), self.target[0]) - margin,
+                        max(max([t[0] for t in self.trajectory] or [0]), self.target[0]) + margin
+                    )
+                    self.ax_trajectory.set_ylim(
+                        min(min([t[1] for t in self.trajectory] or [0]), self.target[1]) - margin,
+                        max(max([t[1] for t in self.trajectory] or [0]), self.target[1]) + margin
+                    )
+                    
+                self.data_queue.task_done()
+            except queue.Empty:
+                break
+        
+        # Si aucune donnée n'est disponible, retourner
+        if not self.timestamps:
+            return
+            
+        # Convertir les timestamps relatifs en secondes
+        t_start = self.timestamps[0]
+        rel_time = [(t - t_start) for t in self.timestamps]
+        
+        # Mettre à jour le graphique de trajectoire
+        if self.trajectory:
+            x_data = [p[0] for p in self.trajectory]
+            y_data = [p[1] for p in self.trajectory]
+            self.trajectory_line.set_data(x_data, y_data)
+            
+            # Position actuelle (dernier point)
+            current_pos = self.trajectory[-1]
+            self.trajectory_point.set_data([current_pos[0]], [current_pos[1]])
+            
+            # Ajouter une annotation pour l'orientation (theta)
+            arrow_length = 0.3
+            dx = arrow_length * math.cos(current_pos[2])
+            dy = arrow_length * math.sin(current_pos[2])
+            
+            # Supprimer les anciennes flèches s'il y en a
+            for artist in self.ax_trajectory.get_children():
+                if isinstance(artist, plt.Arrow):
+                    artist.remove()
+            
+            # Ajouter la nouvelle flèche d'orientation
+            self.ax_trajectory.arrow(current_pos[0], current_pos[1], dx, dy, 
+                          head_width=0.1, head_length=0.1, fc='blue', ec='blue')
+        
+        # Mettre à jour le graphique de coût
+        if self.cost_history:
+            self.cost_line.set_data(rel_time, self.cost_history)
+            if len(self.cost_history) > 1:
+                self.ax_cost.set_xlim(0, rel_time[-1])
+                self.ax_cost.set_ylim(0, max(self.cost_history) * 1.1)
+        
+        # Mettre à jour le graphique des vitesses des roues
+        if self.wheel_speeds:
+            left_speeds = [ws[0] for ws in self.wheel_speeds]
+            right_speeds = [ws[1] for ws in self.wheel_speeds]
+            self.left_wheel_line.set_data(rel_time, left_speeds)
+            self.right_wheel_line.set_data(rel_time, right_speeds)
+            
+            if len(self.wheel_speeds) > 1:
+                self.ax_wheels.set_xlim(0, rel_time[-1])
+                min_speed = min(min(left_speeds), min(right_speeds))
+                max_speed = max(max(left_speeds), max(right_speeds))
+                margin = (max_speed - min_speed) * 0.1 or 0.1
+                self.ax_wheels.set_ylim(min_speed - margin, max_speed + margin)
+        
+        # Mettre à jour le graphique du gradient
+        if self.gradients:
+            grad_left = [g[0] for g in self.gradients]
+            grad_right = [g[1] for g in self.gradients]
+            self.grad_line_left.set_data(rel_time, grad_left)
+            self.grad_line_right.set_data(rel_time, grad_right)
+            
+            if len(self.gradients) > 1:
+                self.ax_gradient.set_xlim(0, rel_time[-1])
+                all_grads = grad_left + grad_right
+                if all_grads:
+                    min_grad = min(all_grads)
+                    max_grad = max(all_grads)
+                    margin = (max_grad - min_grad) * 0.1 or 0.1
+                    self.ax_gradient.set_ylim(min_grad - margin, max_grad + margin)
+        
+        # Mettre à jour le graphique des distances (erreurs)
+        if self.distances:
+            err_x = [d[0] for d in self.distances]
+            err_y = [d[1] for d in self.distances]
+            err_theta = [d[2] for d in self.distances]
+            
+            self.distance_x_line.set_data(rel_time, err_x)
+            self.distance_y_line.set_data(rel_time, err_y)
+            self.distance_theta_line.set_data(rel_time, err_theta)
+            
+            if len(self.distances) > 1:
+                self.ax_distance.set_xlim(0, rel_time[-1])
+                all_errs = err_x + err_y + err_theta
+                if all_errs:
+                    min_err = min(all_errs)
+                    max_err = max(all_errs)
+                    margin = (max_err - min_err) * 0.1 or 0.1
+                    self.ax_distance.set_ylim(min_err - margin, max_err + margin)
+        
+        # Ajuster la disposition pour s'assurer que tout est visible
+        self.fig.canvas.flush_events()
+    
+    def start(self):
+        """Démarre l'affichage des graphiques dans le thread principal"""
+        if not self.running:
+            self.running = True
+            # Initialiser les graphiques seulement lors du démarrage
+            self.setup_plots()
+            print("✅ Monitoring démarré")
+    
+    def stop(self):
+        """Arrête l'affichage"""
+        if self.running:
+            self.running = False
+            if self.fig:
+                plt.close(self.fig)
+            print("✅ Monitoring arrêté")
+    
+    def pause(self):
+        """Met en pause la collecte de données"""
+        self.paused = True
+        
+    def resume(self):
+        """Reprend la collecte de données"""
+        self.paused = False
+    
+    def add_data_point(self, position, wheel_speeds, gradient, cost, distances):
+        """
+        Ajoute un point de données au moniteur
+        
+        Args:
+            position (list): Position [x, y, theta] du robot
+            wheel_speeds (list): Vitesses [gauche, droite] des roues
+            gradient (list): Gradient [gauche, droite] pour l'apprentissage
+            cost (float): Valeur de la fonction de coût
+            distances (list): Distances/erreurs [x, y, theta] par rapport à la cible
+        """
+        if not self.paused and self.running:
+            self.data_queue.put({
+                'type': 'data',
+                'position': position,
+                'wheel_speeds': wheel_speeds,
+                'gradient': gradient,
+                'cost': cost,
+                'distances': distances,
+                'timestamp': time.time()
+            })
+    
+    def set_target(self, target):
+        """
+        Définit la position cible
+        
+        Args:
+            target (list): Position cible [x, y, theta]
+        """
+        if self.running:
+            self.data_queue.put({
+                'type': 'target',
+                'target': target
+            })
+    
+    def save_plots(self, base_filename="robot_monitoring", timestamp=True):
+        """
+        Sauvegarde les graphiques actuels sous forme de fichiers PNG
+        
+        Args:
+            base_filename (str): Nom de base pour les fichiers
+            timestamp (bool): Si True, ajoute un timestamp au nom de fichier
+        """
+        if timestamp:
+            timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+            base_filename = f"{base_filename}_{timestamp_str}"
+        
+        # Sauvegarder la figure complète
+        if self.fig:
+            plt.figure(self.fig.number)
+            plt.savefig(f"{base_filename}_all.png", dpi=300, bbox_inches='tight')
+            print(f"✅ Graphiques sauvegardés sous {base_filename}_all.png")
+    
+    def export_data(self, filename="robot_data.csv", timestamp=True):
+        """
+        Exporte les données collectées dans un fichier CSV
+        
+        Args:
+            filename (str): Nom du fichier CSV
+            timestamp (bool): Si True, ajoute un timestamp au nom de fichier
+        """
+        if timestamp:
+            timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+            base_name, ext = os.path.splitext(filename)
+            filename = f"{base_name}_{timestamp_str}{ext}"
+        
+        try:
+            import pandas as pd
+            import os
+            
+            # Préparer les données pour l'export
+            data = {
+                'timestamp': list(self.timestamps),
+                'position_x': [p[0] for p in self.trajectory],
+                'position_y': [p[1] for p in self.trajectory],
+                'position_theta': [p[2] for p in self.trajectory],
+                'wheel_speed_left': [ws[0] for ws in self.wheel_speeds],
+                'wheel_speed_right': [ws[1] for ws in self.wheel_speeds],
+                'gradient_left': [g[0] for g in self.gradients],
+                'gradient_right': [g[1] for g in self.gradients],
+                'cost': list(self.cost_history),
+                'error_x': [d[0] for d in self.distances],
+                'error_y': [d[1] for d in self.distances],
+                'error_theta': [d[2] for d in self.distances]
+            }
+            
+            # Créer un DataFrame et l'exporter
+            df = pd.DataFrame(data)
+            df.to_csv(filename, index=False)
+            
+            print(f"✅ Données exportées vers {filename}")
+        except ImportError:
+            print("❌ Pandas est requis pour l'export CSV. Installez-le avec: pip install pandas")
+        except Exception as e:
+            print(f"❌ Erreur lors de l'export des données: {str(e)}")
+
+
+# Classe adaptateur pour intégrer le monitoring aux différentes implémentations de l'apprentissage
+class RobotMonitorAdapter:
+    """
+    Adaptateur pour connecter le module de monitoring aux différentes
+    implémentations d'apprentissage (Python natif ou PyTorch)
+    """
+    
+    def __init__(self, alpha_values=None):
+        """
+        Initialise l'adaptateur
+        
+        Args:
+            alpha_values (list): Les valeurs alpha utilisées pour la normalisation [x, y, theta]
+        """
+        self.monitor = RobotMonitor()
+        self.alpha = alpha_values or [1/6, 1/6, 1/(math.pi)]  # Valeurs par défaut
+        self.last_position = None
+        self.last_wheel_speeds = None
+        self.last_gradient = None
+        self.last_target = None
+        self.current_cost = 0.0
+        
+    def start_monitoring(self):
+        """Démarre le monitoring"""
+        self.monitor.start()
+        
+    def stop_monitoring(self):
+        """Arrête le monitoring"""
+        self.monitor.stop()
+        
+    def set_target(self, target):
+        """
+        Définit la position cible et met à jour le moniteur
+        
+        Args:
+            target (list): Position cible [x, y, theta]
+        """
+        self.last_target = target
+        self.monitor.set_target(target)
+    
+    def update(self, position, wheel_speeds, gradient=None, cost=None, add_noise=False):
+        """
+        Met à jour le moniteur avec les données actuelles
+        
+        Args:
+            position (list): Position actuelle [x, y, theta]
+            wheel_speeds (list): Vitesses des roues [gauche, droite]
+            gradient (list, optional): Gradient [gauche, droite]
+            cost (float, optional): Valeur de la fonction de coût
+            add_noise (bool): Si True, ajoute un petit bruit aléatoire pour l'affichage
+        """
+        # Sauvegarder les dernières valeurs
+        self.last_position = position
+        self.last_wheel_speeds = wheel_speeds
+        
+        if gradient is not None:
+            self.last_gradient = gradient
+        
+        # Calculer le coût si non fourni
+        if cost is None and self.last_target is not None:
+            self.current_cost = self._calculate_cost(position, self.last_target)
+        else:
+            self.current_cost = cost or 0.0
+        
+        # Calculer les distances/erreurs par rapport à la cible
+        distances = self._calculate_distances(position, self.last_target or [0, 0, 0])
+        
+        # Ajouter du bruit pour l'affichage si demandé
+        if add_noise and gradient is not None:
+            gradient = [g + np.random.normal(0, 0.001) for g in gradient]
+        
+        # Mettre à jour le moniteur
+        self.monitor.add_data_point(
+            position=position,
+            wheel_speeds=wheel_speeds,
+            gradient=gradient or [0, 0],
+            cost=self.current_cost,
+            distances=distances
+        )
+    
+    def _calculate_cost(self, position, target):
+        """
+        Calcule la fonction de coût
+        
+        Args:
+            position (list): Position actuelle [x, y, theta]
+            target (list): Position cible [x, y, theta]
+            
+        Returns:
+            float: Valeur de la fonction de coût
+        """
+        # Fonction theta_s de l'implémentation originale
+        def theta_s(x, y):
+            return math.tanh(10.*x)*math.atan(1.*y)
+        
+        alpha_x = self.alpha[0]
+        alpha_y = self.alpha[1]
+        alpha_theta = self.alpha[2]
+        
+        return (alpha_x * alpha_x * (position[0] - target[0])**2 + 
+                alpha_y * alpha_y * (position[1] - target[1])**2 + 
+                alpha_theta * alpha_theta * (position[2] - target[2] - 
+                                         theta_s(position[0], position[1]))**2)
+    
+    def _calculate_distances(self, position, target):
+        """
+        Calcule les distances/erreurs par rapport à la cible
+        
+        Args:
+            position (list): Position actuelle [x, y, theta]
+            target (list): Position cible [x, y, theta]
+            
+        Returns:
+            list: Distances/erreurs [x, y, theta]
+        """
+        # Pour l'erreur theta, on considère l'angle minimal (cyclic)
+        theta_diff = (position[2] - target[2]) % (2 * math.pi)
+        if theta_diff > math.pi:
+            theta_diff -= 2 * math.pi
+            
+        return [
+            position[0] - target[0],  # Erreur en X
+            position[1] - target[1],  # Erreur en Y
+            theta_diff                # Erreur en theta
+        ]
+    
+    def save_results(self, base_filename="robot_results"):
+        """
+        Sauvegarde les résultats du monitoring
+        
+        Args:
+            base_filename (str): Nom de base pour les fichiers
+        """
+        # Sauvegarder les graphiques
+        self.monitor.save_plots(base_filename)
+        
+        # Exporter les données
+        try:
+            self.monitor.export_data(f"{base_filename}.csv")
+        except Exception as e:
+            print(f"❌ Erreur lors de l'export CSV: {e}")
