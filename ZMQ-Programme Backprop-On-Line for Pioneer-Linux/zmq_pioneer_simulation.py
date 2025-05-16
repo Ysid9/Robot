@@ -25,7 +25,11 @@ def to_deg(rad):
 
 class ZMQPioneerSimulation:
     def __init__(self):
-        self.scene_path = os.path.abspath('./simu.ttt')
+        # Find the directory this script is in
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        # Use that to create an absolute path to the scene file
+        self.scene_path = os.path.join(current_dir, 'simu.ttt')
+
         self.gain = 2
         self.initial_position = [3, 3, to_rad(45)]
 

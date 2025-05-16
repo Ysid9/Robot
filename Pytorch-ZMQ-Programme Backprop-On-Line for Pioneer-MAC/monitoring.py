@@ -8,6 +8,7 @@ import threading
 import queue
 from collections import deque
 import copy
+import os
 
 class RobotMonitor:
     """
@@ -15,17 +16,19 @@ class RobotMonitor:
     de l'apprentissage en ligne du robot Pioneer.
     """
     
-    def __init__(self, max_points=1000, update_interval=100):
+    def __init__(self, max_points=1000, update_interval=100, world_bounds=(-6, 6, -6, 6)):
         """
         Initialise le moniteur de robot.
         
         Args:
             max_points (int): Nombre maximum de points à conserver dans l'historique
             update_interval (int): Intervalle de mise à jour de l'affichage en ms
+            world_bounds (tuple): Limites du monde (x_min, x_max, y_min, y_max)
         """
         # Configuration
         self.max_points = max_points
         self.update_interval = update_interval
+        self.world_bounds = world_bounds  # Nouvelle propriété pour définir les limites du monde
         
         # Données à suivre
         self.cost_history = deque(maxlen=max_points)
@@ -60,6 +63,16 @@ class RobotMonitor:
         self.ax_trajectory.set_xlabel('Position X (m)')
         self.ax_trajectory.set_ylabel('Position Y (m)')
         self.ax_trajectory.grid(True, linestyle='--', alpha=0.7)
+        
+        # Définir immédiatement les limites du graphique de trajectoire selon world_bounds
+        self.ax_trajectory.set_xlim(self.world_bounds[0], self.world_bounds[1])
+        self.ax_trajectory.set_ylim(self.world_bounds[2], self.world_bounds[3])
+        
+        # Ajouter des lignes de référence à l'origine
+        self.ax_trajectory.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        self.ax_trajectory.axvline(x=0, color='k', linestyle='-', alpha=0.3)
+        
+        # Éléments de la trajectoire
         self.trajectory_line, = self.ax_trajectory.plot([], [], 'b-', linewidth=2, label='Trajectoire')
         self.trajectory_point, = self.ax_trajectory.plot([], [], 'ro', markersize=8, label='Position actuelle')
         self.target_point, = self.ax_trajectory.plot([], [], 'g*', markersize=12, label='Cible')
@@ -143,16 +156,8 @@ class RobotMonitor:
                     # Mettre à jour le point cible dans le graphique de trajectoire
                     self.target_point.set_data([self.target[0]], [self.target[1]])
                     
-                    # Ajuster les limites du graphique de trajectoire
-                    margin = 1.0  # Marge en mètres
-                    self.ax_trajectory.set_xlim(
-                        min(min([t[0] for t in self.trajectory] or [0]), self.target[0]) - margin,
-                        max(max([t[0] for t in self.trajectory] or [0]), self.target[0]) + margin
-                    )
-                    self.ax_trajectory.set_ylim(
-                        min(min([t[1] for t in self.trajectory] or [0]), self.target[1]) - margin,
-                        max(max([t[1] for t in self.trajectory] or [0]), self.target[1]) + margin
-                    )
+                    # Note: Nous ne modifions plus les limites ici car elles sont fixées
+                    # par world_bounds
                     
                 self.data_queue.task_done()
             except queue.Empty:
@@ -194,8 +199,10 @@ class RobotMonitor:
         if self.cost_history:
             self.cost_line.set_data(rel_time, self.cost_history)
             if len(self.cost_history) > 1:
-                self.ax_cost.set_xlim(0, rel_time[-1])
-                self.ax_cost.set_ylim(0, max(self.cost_history) * 1.1)
+                self.ax_cost.set_xlim(0, max(rel_time[-1], 1.0))  # Au moins 1 seconde affichée
+                # Définir une limite minimale pour l'axe y pour éviter les problèmes avec des coûts très faibles
+                ymax = max(max(self.cost_history) * 1.1, 0.1)
+                self.ax_cost.set_ylim(0, ymax)
         
         # Mettre à jour le graphique des vitesses des roues
         if self.wheel_speeds:
@@ -205,10 +212,10 @@ class RobotMonitor:
             self.right_wheel_line.set_data(rel_time, right_speeds)
             
             if len(self.wheel_speeds) > 1:
-                self.ax_wheels.set_xlim(0, rel_time[-1])
-                min_speed = min(min(left_speeds), min(right_speeds))
-                max_speed = max(max(left_speeds), max(right_speeds))
-                margin = (max_speed - min_speed) * 0.1 or 0.1
+                self.ax_wheels.set_xlim(0, max(rel_time[-1], 1.0))  # Au moins 1 seconde affichée
+                min_speed = min(min(left_speeds or [0]), min(right_speeds or [0]))
+                max_speed = max(max(left_speeds or [0]), max(right_speeds or [0]))
+                margin = max((max_speed - min_speed) * 0.1, 0.1)  # Marge d'au moins 0.1
                 self.ax_wheels.set_ylim(min_speed - margin, max_speed + margin)
         
         # Mettre à jour le graphique du gradient
@@ -219,12 +226,12 @@ class RobotMonitor:
             self.grad_line_right.set_data(rel_time, grad_right)
             
             if len(self.gradients) > 1:
-                self.ax_gradient.set_xlim(0, rel_time[-1])
+                self.ax_gradient.set_xlim(0, max(rel_time[-1], 1.0))  # Au moins 1 seconde affichée
                 all_grads = grad_left + grad_right
                 if all_grads:
                     min_grad = min(all_grads)
                     max_grad = max(all_grads)
-                    margin = (max_grad - min_grad) * 0.1 or 0.1
+                    margin = max((max_grad - min_grad) * 0.1, 0.1)  # Marge d'au moins 0.1
                     self.ax_gradient.set_ylim(min_grad - margin, max_grad + margin)
         
         # Mettre à jour le graphique des distances (erreurs)
@@ -238,12 +245,12 @@ class RobotMonitor:
             self.distance_theta_line.set_data(rel_time, err_theta)
             
             if len(self.distances) > 1:
-                self.ax_distance.set_xlim(0, rel_time[-1])
+                self.ax_distance.set_xlim(0, max(rel_time[-1], 1.0))  # Au moins 1 seconde affichée
                 all_errs = err_x + err_y + err_theta
                 if all_errs:
                     min_err = min(all_errs)
                     max_err = max(all_errs)
-                    margin = (max_err - min_err) * 0.1 or 0.1
+                    margin = max((max_err - min_err) * 0.1, 0.1)  # Marge d'au moins 0.1
                     self.ax_distance.set_ylim(min_err - margin, max_err + margin)
         
         # Ajuster la disposition pour s'assurer que tout est visible
@@ -320,11 +327,17 @@ class RobotMonitor:
             timestamp_str = time.strftime("%Y%m%d_%H%M%S")
             base_filename = f"{base_filename}_{timestamp_str}"
         
+        # Créer le dossier de résultats s'il n'existe pas
+        results_dir = "results"
+        if not os.path.exists(results_dir):
+            os.makedirs(results_dir)
+        
         # Sauvegarder la figure complète
         if self.fig:
             plt.figure(self.fig.number)
-            plt.savefig(f"{base_filename}_all.png", dpi=300, bbox_inches='tight')
-            print(f"✅ Graphiques sauvegardés sous {base_filename}_all.png")
+            save_path = os.path.join(results_dir, f"{base_filename}_all.png")
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"✅ Graphiques sauvegardés sous {save_path}")
     
     def export_data(self, filename="robot_data.csv", timestamp=True):
         """
@@ -334,14 +347,21 @@ class RobotMonitor:
             filename (str): Nom du fichier CSV
             timestamp (bool): Si True, ajoute un timestamp au nom de fichier
         """
-        if timestamp:
-            timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-            base_name, ext = os.path.splitext(filename)
-            filename = f"{base_name}_{timestamp_str}{ext}"
-        
         try:
             import pandas as pd
-            import os
+            
+            # Créer le dossier de résultats s'il n'existe pas
+            results_dir = "results"
+            if not os.path.exists(results_dir):
+                os.makedirs(results_dir)
+            
+            if timestamp:
+                timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+                base_name, ext = os.path.splitext(filename)
+                filename = f"{base_name}_{timestamp_str}{ext}"
+            
+            # Chemin complet du fichier
+            file_path = os.path.join(results_dir, filename)
             
             # Préparer les données pour l'export
             data = {
@@ -361,9 +381,9 @@ class RobotMonitor:
             
             # Créer un DataFrame et l'exporter
             df = pd.DataFrame(data)
-            df.to_csv(filename, index=False)
+            df.to_csv(file_path, index=False)
             
-            print(f"✅ Données exportées vers {filename}")
+            print(f"✅ Données exportées vers {file_path}")
         except ImportError:
             print("❌ Pandas est requis pour l'export CSV. Installez-le avec: pip install pandas")
         except Exception as e:
@@ -377,14 +397,17 @@ class RobotMonitorAdapter:
     implémentations d'apprentissage (Python natif ou PyTorch)
     """
     
-    def __init__(self, alpha_values=None):
+    def __init__(self, alpha_values=None, world_bounds=(-6, 6, -6, 6)):
         """
         Initialise l'adaptateur
         
         Args:
             alpha_values (list): Les valeurs alpha utilisées pour la normalisation [x, y, theta]
+            world_bounds (tuple): Limites du monde (x_min, x_max, y_min, y_max)
         """
-        self.monitor = RobotMonitor()
+        # Créer le moniteur avec les limites du monde personnalisées
+        self.monitor = RobotMonitor(world_bounds=world_bounds)
+        
         self.alpha = alpha_values or [1/6, 1/6, 1/(math.pi)]  # Valeurs par défaut
         self.last_position = None
         self.last_wheel_speeds = None
